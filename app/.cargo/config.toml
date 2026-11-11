@@ -1,0 +1,10 @@
+# Build output location.
+#
+# This folder is on the synced T: drive. Build output (target/) should not be
+# synced, and Windows locks the .exe files built there, so keep it local.
+# Cargo cannot expand %VARIABLES% in this file, so set the environment variable
+# once on the build machine instead (PowerShell or Command Prompt):
+#
+#   setx CARGO_TARGET_DIR "%LOCALAPPDATA%\iso2dsd\target"
+#
+# Open a new terminal after setx. Then `cargo build` writes there.

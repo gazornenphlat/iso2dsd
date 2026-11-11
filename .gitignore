@@ -1,0 +1,6 @@
+target/
+target-new/
+app/target/
+app/target-new/
+app/shots/
+*.png

@@ -1,0 +1,10 @@
+[package]
+name = "iso2dsd-gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.29", features = ["persistence"] }
+serde = { version = "1", features = ["derive"] }
+rfd = "0.15"
+image = { version = "0.25", default-features = false, features = ["png"] }
