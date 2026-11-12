@@ -7,4 +7,5 @@ edition = "2021"
 eframe = { version = "0.29", features = ["persistence"] }
 serde = { version = "1", features = ["derive"] }
 rfd = "0.15"
+fs2 = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }

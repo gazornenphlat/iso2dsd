@@ -1,7 +1,6 @@
 //! Builds the converter's command line and runs it, the way the original program does.
 
-use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -13,6 +12,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
+
+/// The log keeps at most this many lines; the oldest are dropped first.
+const MAX_LOG_LINES: usize = 5000;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Channels {
@@ -95,29 +97,31 @@ pub fn program_name() -> &'static str {
 }
 
 /// Flags in the same order as the original: -c, -C, -P, channels, format, then --input.
-pub fn build_args(opts: &Options, input: &str) -> Vec<String> {
-    let mut args: Vec<&str> = Vec::new();
+/// The input is passed as an OS string, so file names that are not valid Unicode arrive intact.
+pub fn build_args(opts: &Options, input: &OsStr) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::new();
+    let mut flag = |f: &str| args.push(OsString::from(f));
     if opts.dst_to_dsd {
-        args.push("-c");
+        flag("-c");
     }
     if opts.cue_sheet {
-        args.push("-C");
+        flag("-C");
     }
     if opts.print {
-        args.push("-P");
+        flag("-P");
     }
-    args.push(opts.channels.flag());
-    args.push(opts.format.flag());
-    args.push("--input");
-    args.push(input);
-    args.into_iter().map(String::from).collect()
+    flag(opts.channels.flag());
+    flag(opts.format.flag());
+    flag("--input");
+    args.push(input.to_os_string());
+    args
 }
 
 /// One run of the converter.
 pub struct Job {
     /// Folder the converter runs in. Its output is written here.
     pub work_dir: PathBuf,
-    pub args: Vec<String>,
+    pub args: Vec<OsString>,
     /// Short name shown in the log, such as the ISO file name.
     pub source: String,
 }
@@ -130,17 +134,42 @@ pub struct Stop {
 }
 
 impl Stop {
-    /// Asks for the run to stop: the converter process is killed and no later job starts.
+    /// Asks for the run to stop: the converter (and anything it started) is killed,
+    /// and no later job starts.
     pub fn request(&self) {
         self.flag.store(true, Ordering::SeqCst);
         if let Some(child) = lock(&self.child).as_mut() {
-            let _ = child.kill();
+            kill_tree(child);
         }
     }
 
     pub fn is_set(&self) -> bool {
         self.flag.load(Ordering::SeqCst)
     }
+}
+
+/// Kills the process and its children. On Windows, taskkill /T also ends child processes.
+fn kill_tree(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("taskkill");
+        let _ = hide_console(cmd.args(["/PID", &child.id().to_string(), "/T", "/F"]))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        // The converter runs in its own process group (see run_one), so this ends it and its children.
+        let _ = Command::new("kill")
+            .args(["-s", "KILL", "--", &format!("-{}", child.id())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -152,7 +181,11 @@ pub enum Msg {
     Output(String),
     Help(String),
     /// A job is starting: "File index of total: name".
-    Start { index: usize, total: usize, name: String },
+    Start {
+        index: usize,
+        total: usize,
+        name: String,
+    },
     Done,
 }
 
@@ -179,6 +212,7 @@ impl Log {
         self.lines.push(format!("File {index} of {total}: {name}"));
         self.progress = None;
         self.last_was_progress = false;
+        self.trim();
     }
 
     pub fn push(&mut self, raw: &str) {
@@ -196,6 +230,15 @@ impl Log {
             self.lines.push(text);
         }
         self.last_was_progress = progress;
+        self.trim();
+    }
+
+    /// Drops the oldest lines when the log is too long, so long batches stay responsive.
+    fn trim(&mut self) {
+        if self.lines.len() > MAX_LOG_LINES {
+            let extra = self.lines.len() - MAX_LOG_LINES;
+            self.lines.drain(..extra);
+        }
     }
 }
 
@@ -229,7 +272,11 @@ pub fn run_jobs(program_dir: PathBuf, jobs: Vec<Job>, stop: Stop, tx: Sender<Msg
         if stop.is_set() {
             break;
         }
-        let _ = tx.send(Msg::Start { index: i + 1, total, name: job.source.clone() });
+        let _ = tx.send(Msg::Start {
+            index: i + 1,
+            total,
+            name: job.source.clone(),
+        });
         if let Err(e) = run_one(&program_dir, job, &stop, &tx) {
             let name = program_name().trim_start_matches("./");
             let _ = tx.send(Msg::Output(format!(
@@ -239,7 +286,9 @@ pub fn run_jobs(program_dir: PathBuf, jobs: Vec<Job>, stop: Stop, tx: Sender<Msg
         }
     }
     if stop.is_set() {
-        let _ = tx.send(Msg::Output("Stopped. Files already written are kept.".into()));
+        let _ = tx.send(Msg::Output(
+            "Stopped. Files already written are kept.".into(),
+        ));
     }
     let _ = tx.send(Msg::Done);
 }
@@ -267,29 +316,31 @@ fn run_one(program_dir: &Path, job: &Job, stop: &Stop, tx: &Sender<Msg>) -> io::
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    new_process_group(&mut cmd);
     let mut child = hide_console(&mut cmd).spawn()?;
     let out = child.stdout.take().expect("stdout is piped");
     let err = child.stderr.take().expect("stderr is piped");
     let readers: [JoinHandle<()>; 2] = [pump_thread(out, tx.clone()), pump_thread(err, tx.clone())];
+    // A Stop that arrived before the child was stored must still take effect.
     if stop.is_set() {
-        let _ = child.kill();
+        kill_tree(&mut child);
     }
     *lock(&stop.child) = Some(child);
     let status = wait_for(stop)?;
     for reader in readers {
         let _ = reader.join();
     }
-    match status {
-        Some(s) if !s.success() && !stop.is_set() => {
+    if let Some(s) = status {
+        if !s.success() && !stop.is_set() {
             let _ = tx.send(Msg::Output(format!("The converter stopped with {s}")));
         }
-        _ => {}
     }
     report_new_files(&job.work_dir, &before, tx);
     Ok(())
 }
 
-/// Waits for the converter to exit, polling so that Stop can end it. None if it was already stopped.
+/// Waits for the converter to exit, polling so that Stop can end it.
+/// Returns None if the process was already taken out of the slot.
 fn wait_for(stop: &Stop) -> io::Result<Option<ExitStatus>> {
     loop {
         {
@@ -307,34 +358,34 @@ fn wait_for(stop: &Stop) -> io::Result<Option<ExitStatus>> {
     }
 }
 
-type Snapshot = HashMap<OsString, (SystemTime, u64)>;
+type Snapshot = Vec<(OsString, (SystemTime, u64))>;
 
-/// Files directly in `dir`, with their modified time and size.
+/// Files directly in `dir`, with their modified time and size, sorted by name.
 fn snapshot(dir: &Path) -> Snapshot {
-    let mut map = HashMap::new();
+    let mut files = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             if let Ok(meta) = entry.metadata() {
                 if meta.is_file() {
                     let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                    map.insert(entry.file_name(), (mtime, meta.len()));
+                    files.push((entry.file_name(), (mtime, meta.len())));
                 }
             }
         }
     }
-    map
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
 }
 
 /// Lists files that were added or changed in `dir` while the job ran.
 /// Only files directly in that folder are checked; files in subfolders are not listed.
 fn report_new_files(dir: &Path, before: &Snapshot, tx: &Sender<Msg>) {
     let after = snapshot(dir);
-    let mut written: Vec<(String, u64)> = after
+    let written: Vec<(String, u64)> = after
         .iter()
-        .filter(|(name, v)| before.get(*name) != Some(*v))
+        .filter(|entry| before.iter().find(|b| b.0 == entry.0) != Some(entry))
         .map(|(name, (_, len))| (name.to_string_lossy().into_owned(), *len))
         .collect();
-    written.sort();
     if written.is_empty() {
         let _ = tx.send(Msg::Output(format!(
             "No new files were found in {}. Check the output above.",
@@ -390,14 +441,30 @@ fn hide_console(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+/// Puts the converter in its own process group, so Stop can end everything it started.
+#[cfg(unix)]
+fn new_process_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn new_process_group(_cmd: &mut Command) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn args_as_strings(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
     #[test]
     fn default_flags_for_one_file() {
-        let args = build_args(&Options::default(), "a.iso");
-        assert_eq!(args, ["-2", "-p", "--input", "a.iso"]);
+        let args = build_args(&Options::default(), OsStr::new("a.iso"));
+        assert_eq!(args_as_strings(&args), ["-2", "-p", "--input", "a.iso"]);
     }
 
     #[test]
@@ -409,7 +476,11 @@ mod tests {
             cue_sheet: true,
             print: true,
         };
-        assert_eq!(build_args(&opts, "x"), ["-c", "-C", "-P", "-m", "-I", "--input", "x"]);
+        let args = build_args(&opts, OsStr::new("x"));
+        assert_eq!(
+            args_as_strings(&args),
+            ["-c", "-C", "-P", "-m", "-I", "--input", "x"]
+        );
     }
 
     #[test]
@@ -439,6 +510,118 @@ mod tests {
         assert!(log.progress.is_some());
         log.start_file(2, 3, "b.iso");
         assert_eq!(log.progress, None);
-        assert_eq!(log.lines.last().map(String::as_str), Some("File 2 of 3: b.iso"));
+        assert_eq!(
+            log.lines.last().map(String::as_str),
+            Some("File 2 of 3: b.iso")
+        );
+    }
+
+    #[test]
+    fn log_keeps_only_the_newest_lines() {
+        let mut log = Log::default();
+        for i in 0..(MAX_LOG_LINES + 10) {
+            log.push(&format!("line {i}"));
+        }
+        assert!(log.lines.len() <= MAX_LOG_LINES);
+        assert_eq!(
+            log.lines.last().map(String::as_str),
+            Some(format!("line {}", MAX_LOG_LINES + 9).as_str())
+        );
+    }
+}
+
+/// Runs the real pipeline against a small fake converter (a shell script), so Stop,
+/// progress and the output check are tested end to end. Unix only.
+#[cfg(all(test, unix))]
+mod fake_converter {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc::{channel, Receiver};
+    use std::time::Instant;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("iso2dsd-test-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Writes ./sacd_extract into `dir` with the given shell body.
+    fn fake_program(dir: &Path, body: &str) {
+        let path = dir.join("sacd_extract");
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn job(work_dir: &Path) -> Job {
+        Job {
+            work_dir: work_dir.to_path_buf(),
+            args: vec![OsString::from("--input"), OsString::from("disc.iso")],
+            source: "disc.iso".into(),
+        }
+    }
+
+    /// Everything the worker said, up to and including Done.
+    fn drain(rx: Receiver<Msg>) -> (Vec<String>, bool) {
+        let mut lines = Vec::new();
+        let mut done = false;
+        for msg in rx.try_iter() {
+            match msg {
+                Msg::Output(s) => lines.push(s),
+                Msg::Done => done = true,
+                _ => {}
+            }
+        }
+        (lines, done)
+    }
+
+    #[test]
+    fn writes_output_and_reports_progress() {
+        let program = scratch("ok-program");
+        let work = scratch("ok-work");
+        fake_program(
+            &program,
+            "echo 'Processing 1 of 2'; echo 'Processing 2 of 2'; echo data > out.dsf",
+        );
+        let (tx, rx) = channel();
+        run_jobs(program, vec![job(&work)], Stop::default(), tx);
+        let (lines, done) = drain(rx);
+        assert!(done);
+        assert!(
+            lines.iter().any(|l| l == "Wrote out.dsf (0.0 MB)"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn says_so_when_nothing_is_written() {
+        let program = scratch("empty-program");
+        let work = scratch("empty-work");
+        fake_program(&program, "true");
+        let (tx, rx) = channel();
+        run_jobs(program, vec![job(&work)], Stop::default(), tx);
+        let (lines, _) = drain(rx);
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("No new files were found")));
+    }
+
+    #[test]
+    fn stop_ends_a_running_converter_quickly() {
+        let program = scratch("stop-program");
+        let work = scratch("stop-work");
+        fake_program(&program, "sleep 30");
+        let (tx, rx) = channel();
+        let stop = Stop::default();
+        let worker_stop = stop.clone();
+        let started = Instant::now();
+        let handle = thread::spawn(move || run_jobs(program, vec![job(&work)], worker_stop, tx));
+        thread::sleep(Duration::from_millis(300));
+        stop.request();
+        handle.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let (lines, done) = drain(rx);
+        assert!(done);
+        assert!(lines.iter().any(|l| l.starts_with("Stopped.")), "{lines:?}");
     }
 }

@@ -10,6 +10,8 @@ use eframe::egui::{self, Align2, Color32, RichText, Stroke, Vec2, ViewportComman
 use serde::{Deserialize, Serialize};
 
 use convert::{build_args, program_name, Channels, Format, Job, Log, Msg, Options, Stop};
+use std::ffi::OsStr;
+use std::fs;
 
 const ACCENT: Color32 = Color32::from_rgb(31, 92, 176);
 const PAGE: Color32 = Color32::from_rgb(241, 244, 249);
@@ -64,6 +66,8 @@ struct App {
     frames: u32,
     shot: Option<PathBuf>,
     stop: Stop,
+    /// Jobs waiting for the user to confirm they may replace existing files, with those names.
+    pending: Option<(Vec<Job>, Vec<String>)>,
 }
 
 impl App {
@@ -84,6 +88,7 @@ impl App {
             frames: 0,
             shot,
             stop: Stop::default(),
+            pending: None,
         }
     }
 
@@ -100,18 +105,7 @@ impl App {
     }
 
     fn server_address(&self) -> String {
-        let ip = self
-            .s
-            .octets
-            .iter()
-            .map(|o| o.parse::<u32>().unwrap_or(0).min(255).to_string())
-            .collect::<Vec<_>>()
-            .join(".");
-        if self.s.port.is_empty() {
-            ip
-        } else {
-            format!("{ip}:{}", self.s.port)
-        }
+        server_address(&self.s.octets, &self.s.port)
     }
 
     fn start_convert(&mut self) {
@@ -130,7 +124,7 @@ impl App {
                     .iter()
                     .map(|f| Job {
                         work_dir: f.parent().map(Path::to_path_buf).unwrap_or_else(app_dir),
-                        args: build_args(&opts, &f.to_string_lossy()),
+                        args: build_args(&opts, f.as_os_str()),
                         source: f
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
@@ -142,11 +136,26 @@ impl App {
                 let address = self.server_address();
                 vec![Job {
                     work_dir: app_dir(),
-                    args: build_args(&opts, &address),
+                    args: build_args(&opts, OsStr::new(&address)),
                     source: address,
                 }]
             }
         };
+        if self.s.input_mode == InputMode::Files {
+            if let Some(message) = space_shortfall(&self.files) {
+                self.notice = Some(("Not enough free space".into(), message));
+                return;
+            }
+            let existing = existing_outputs(&self.files);
+            if !existing.is_empty() {
+                self.pending = Some((jobs, existing));
+                return;
+            }
+        }
+        self.launch(jobs);
+    }
+
+    fn launch(&mut self, jobs: Vec<Job>) {
         self.log.clear();
         let (tx, rx) = channel();
         let stop = Stop::default();
@@ -190,12 +199,21 @@ impl App {
 
     fn draw_header(&self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("header")
-            .frame(egui::Frame::none().fill(ACCENT).inner_margin(egui::Margin::symmetric(18.0, 12.0)))
+            .frame(
+                egui::Frame::none()
+                    .fill(ACCENT)
+                    .inner_margin(egui::Margin::symmetric(18.0, 12.0)),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     wave_icon(ui);
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("ISO2DSD").size(22.0).strong().color(Color32::WHITE));
+                        ui.label(
+                            RichText::new("ISO2DSD")
+                                .size(22.0)
+                                .strong()
+                                .color(Color32::WHITE),
+                        );
                         ui.label(
                             RichText::new("Turn SACD disc images into DSD audio files")
                                 .color(Color32::from_rgb(205, 223, 246)),
@@ -208,7 +226,11 @@ impl App {
     fn draw_footer(&mut self, ctx: &egui::Context) {
         let busy = self.busy();
         egui::TopBottomPanel::bottom("footer")
-            .frame(egui::Frame::none().fill(PAGE).inner_margin(egui::Margin::symmetric(16.0, 10.0)))
+            .frame(
+                egui::Frame::none()
+                    .fill(PAGE)
+                    .inner_margin(egui::Margin::symmetric(16.0, 10.0)),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!busy, egui::Button::new("Help")).clicked() {
@@ -221,7 +243,9 @@ impl App {
                         if ui.button("Quit").clicked() {
                             ctx.send_viewport_cmd(ViewportCommand::Close);
                         }
-                        ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).color(MUTED));
+                        ui.label(
+                            RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).color(MUTED),
+                        );
                         if self.converter_found {
                             ui.label(RichText::new("Converter ready").color(MUTED));
                         } else {
@@ -243,7 +267,11 @@ impl App {
         egui::SidePanel::right("options")
             .exact_width(268.0)
             .resizable(false)
-            .frame(egui::Frame::none().fill(PAGE).inner_margin(egui::Margin::symmetric(14.0, 14.0)))
+            .frame(
+                egui::Frame::none()
+                    .fill(PAGE)
+                    .inner_margin(egui::Margin::symmetric(14.0, 14.0)),
+            )
             .show(ctx, |ui| {
                 card(ui, |ui| {
                     ui.label(RichText::new("Options").size(16.0).strong());
@@ -277,7 +305,10 @@ impl App {
                     ui.add_space(14.0);
                     let label = if busy { "Converting..." } else { "Convert" };
                     let button = egui::Button::new(
-                        RichText::new(label).size(16.0).strong().color(Color32::WHITE),
+                        RichText::new(label)
+                            .size(16.0)
+                            .strong()
+                            .color(Color32::WHITE),
                     )
                     .fill(ACCENT)
                     .min_size(Vec2::new(ui.available_width(), 40.0));
@@ -288,7 +319,11 @@ impl App {
                         ui.add_space(6.0);
                         let stop = egui::Button::new(RichText::new("Stop").strong())
                             .min_size(Vec2::new(ui.available_width(), 32.0));
-                        if ui.add(stop).on_hover_text("Stops the current file and skips the rest.").clicked() {
+                        if ui
+                            .add(stop)
+                            .on_hover_text("Stops the current file and skips the rest.")
+                            .clicked()
+                        {
                             self.stop.request();
                         }
                     }
@@ -312,7 +347,10 @@ impl App {
 
     fn draw_files(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui.add_enabled(!self.busy(), egui::Button::new("Add ISO files...")).clicked() {
+            if ui
+                .add_enabled(!self.busy(), egui::Button::new("Add ISO files..."))
+                .clicked()
+            {
                 let mut dialog = rfd::FileDialog::new().add_filter("ISO image", &["iso"]);
                 if let Some(dir) = &self.s.last_dir {
                     dialog = dialog.set_directory(dir);
@@ -324,7 +362,10 @@ impl App {
                     self.add_files(picked);
                 }
             }
-            if ui.add_enabled(!self.files.is_empty(), egui::Button::new("Clear")).clicked() {
+            if ui
+                .add_enabled(!self.files.is_empty(), egui::Button::new("Clear"))
+                .clicked()
+            {
                 self.files.clear();
             }
             ui.label(RichText::new(format!("{} selected", self.files.len())).color(MUTED));
@@ -335,19 +376,25 @@ impl App {
             return;
         }
         let mut remove = None;
-        egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
-            for (i, f) in self.files.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    if ui.small_button("Remove").clicked() {
-                        remove = Some(i);
-                    }
-                    let name = f.file_name().map(|n| n.to_string_lossy().into_owned());
-                    ui.label(name.unwrap_or_default());
-                    let folder = f.parent().map(|p| p.display().to_string());
-                    ui.label(RichText::new(folder.unwrap_or_default()).small().color(MUTED));
-                });
-            }
-        });
+        egui::ScrollArea::vertical()
+            .max_height(120.0)
+            .show(ui, |ui| {
+                for (i, f) in self.files.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Remove").clicked() {
+                            remove = Some(i);
+                        }
+                        let name = f.file_name().map(|n| n.to_string_lossy().into_owned());
+                        ui.label(name.unwrap_or_default());
+                        let folder = f.parent().map(|p| p.display().to_string());
+                        ui.label(
+                            RichText::new(folder.unwrap_or_default())
+                                .small()
+                                .color(MUTED),
+                        );
+                    });
+                }
+            });
         if let Some(i) = remove {
             self.files.remove(i);
         }
@@ -392,7 +439,10 @@ impl App {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     if self.log.lines.is_empty() {
-                        ui.label(RichText::new("Nothing yet. Choose files and press Convert.").color(MUTED));
+                        ui.label(
+                            RichText::new("Nothing yet. Choose files and press Convert.")
+                                .color(MUTED),
+                        );
                     }
                     for line in &self.log.lines {
                         ui.label(RichText::new(line).monospace());
@@ -419,15 +469,51 @@ impl App {
             self.notice = None;
         }
 
+        let mut choice = None;
+        if let Some((_, names)) = &self.pending {
+            egui::Window::new("Replace existing files?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("These files may be replaced by this conversion:");
+                    for name in names.iter().take(10) {
+                        ui.label(RichText::new(name).monospace());
+                    }
+                    if names.len() > 10 {
+                        ui.label(format!("...and {} more", names.len() - 10));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Convert anyway").clicked() {
+                            choice = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            choice = Some(false);
+                        }
+                    });
+                });
+        }
+        match choice {
+            Some(true) => {
+                if let Some((jobs, _)) = self.pending.take() {
+                    self.launch(jobs);
+                }
+            }
+            Some(false) => self.pending = None,
+            None => {}
+        }
+
         let mut open = true;
         if let Some(text) = &self.help {
             egui::Window::new("Help")
                 .open(&mut open)
                 .default_size([640.0, 420.0])
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                        ui.label(RichText::new(text).monospace());
-                    });
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(text).monospace());
+                        });
                 });
         }
         if !open {
@@ -437,8 +523,16 @@ impl App {
 
     /// Drag and drop: .iso files dropped on the window join the file list.
     fn handle_drops(&mut self, ctx: &egui::Context) {
-        let dropped: Vec<PathBuf> =
-            ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        if self.busy() {
+            return;
+        }
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
         if !dropped.is_empty() {
             self.s.input_mode = InputMode::Files;
             self.add_files(dropped);
@@ -447,7 +541,9 @@ impl App {
 
     /// --screenshot <file.png>: draw a while, save the window as a PNG, then exit.
     fn screenshot_step(&mut self, ctx: &egui::Context) {
-        let Some(path) = self.shot.clone() else { return };
+        let Some(path) = self.shot.clone() else {
+            return;
+        };
         self.frames += 1;
         if self.frames == SCREENSHOT_AFTER_FRAMES {
             ctx.send_viewport_cmd(ViewportCommand::Screenshot);
@@ -463,7 +559,13 @@ impl App {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            let saved = image::save_buffer(&path, image.as_raw(), w as u32, h as u32, image::ColorType::Rgba8);
+            let saved = image::save_buffer(
+                &path,
+                image.as_raw(),
+                w as u32,
+                h as u32,
+                image::ColorType::Rgba8,
+            );
             match saved {
                 Ok(()) => {
                     println!("saved {}", path.display());
@@ -491,7 +593,11 @@ impl eframe::App for App {
         self.draw_footer(ctx);
         self.draw_options(ctx);
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(PAGE).inner_margin(egui::Margin::symmetric(14.0, 14.0)))
+            .frame(
+                egui::Frame::none()
+                    .fill(PAGE)
+                    .inner_margin(egui::Margin::symmetric(14.0, 14.0)),
+            )
             .show(ctx, |ui| {
                 self.draw_input(ui);
                 ui.add_space(12.0);
@@ -537,7 +643,11 @@ fn apply_style(ctx: &egui::Context) {
     visuals.selection.bg_fill = ACCENT;
     visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
     visuals.hyperlink_color = ACCENT;
-    for w in [&mut visuals.widgets.inactive, &mut visuals.widgets.hovered, &mut visuals.widgets.active] {
+    for w in [
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+    ] {
         w.rounding = egui::Rounding::same(5.0);
     }
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(190, 200, 215));
@@ -565,7 +675,10 @@ fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 fn wave_icon(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(44.0), egui::Sense::hover());
     ui.painter().rect_filled(rect, 10.0, Color32::WHITE);
-    for (i, h) in [10.0_f32, 22.0, 30.0, 16.0, 34.0, 20.0, 12.0].iter().enumerate() {
+    for (i, h) in [10.0_f32, 22.0, 30.0, 16.0, 34.0, 20.0, 12.0]
+        .iter()
+        .enumerate()
+    {
         let x = rect.left() + 8.0 + i as f32 * 4.6;
         let bar = egui::Rect::from_center_size(egui::pos2(x, rect.center().y), Vec2::new(2.6, *h));
         ui.painter().rect_filled(bar, 1.5, ACCENT);
@@ -578,6 +691,81 @@ fn keep_digits(s: &mut String, max: usize) {
     s.truncate(max);
 }
 
+/// The address the server input uses: four parts clamped to 0..=255, and the port if one is given.
+fn server_address(octets: &[String; 4], port: &str) -> String {
+    let ip = octets
+        .iter()
+        .map(|o| o.parse::<u32>().unwrap_or(0).min(255).to_string())
+        .collect::<Vec<_>>()
+        .join(".");
+    if port.is_empty() {
+        ip
+    } else {
+        format!("{ip}:{port}")
+    }
+}
+
+/// Checks that each output folder has room for the ISO files written into it.
+/// The output is about the same size as the input, so the ISO sizes are the estimate.
+fn space_shortfall(files: &[PathBuf]) -> Option<String> {
+    let mut needed: Vec<(PathBuf, u64)> = Vec::new();
+    for f in files {
+        let dir = f.parent().map(Path::to_path_buf).unwrap_or_else(app_dir);
+        let size = fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+        match needed.iter_mut().find(|(d, _)| *d == dir) {
+            Some((_, total)) => *total += size,
+            None => needed.push((dir, size)),
+        }
+    }
+    for (dir, need) in needed {
+        if let Ok(free) = fs2::available_space(&dir) {
+            if free < need {
+                return Some(format!(
+                    "{} needs about {} free for the output, but only {} is available.",
+                    dir.display(),
+                    gigabytes(need),
+                    gigabytes(free)
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn gigabytes(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+}
+
+/// Files already in an output folder whose names start with an ISO's name.
+/// The converter's output names are not known for certain, so this is a conservative check.
+fn existing_outputs(files: &[PathBuf]) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for f in files {
+        let (Some(dir), Some(stem)) = (f.parent(), f.file_stem()) else {
+            continue;
+        };
+        let stem = stem.to_string_lossy().into_owned();
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !is_iso(&path) && name.starts_with(&stem) && path.is_file() && !found.contains(&name)
+            {
+                found.push(name);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 fn is_iso(p: &Path) -> bool {
     p.extension().is_some_and(|e| e.eq_ignore_ascii_case("iso"))
 }
@@ -588,4 +776,31 @@ fn app_dir() -> PathBuf {
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_address_clamps_parts_and_adds_the_port() {
+        let octets = ["999".to_string(), "0".into(), "0".into(), "1".into()];
+        assert_eq!(server_address(&octets, ""), "255.0.0.1");
+        assert_eq!(server_address(&octets, "2002"), "255.0.0.1:2002");
+        let empty: [String; 4] = std::array::from_fn(|_| String::new());
+        assert_eq!(server_address(&empty, "9"), "0.0.0.0:9");
+    }
+
+    #[test]
+    fn keep_digits_drops_other_characters_and_limits_length() {
+        let mut s = "a1b22345".to_string();
+        keep_digits(&mut s, 3);
+        assert_eq!(s, "122");
+    }
+
+    #[test]
+    fn only_iso_files_are_accepted() {
+        assert!(is_iso(Path::new("Disc.ISO")));
+        assert!(!is_iso(Path::new("notes.iso.txt")));
+    }
 }

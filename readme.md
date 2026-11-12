@@ -44,14 +44,21 @@ PNG, and exits.
      track), Sony DSF (`-s`), or Raw ISO (`-I`).
    - **Convert DST to DSD** (`-c`), **Write a cue sheet** (`-C`), **Print disc
      information** (`-P`).
-3. Click **Convert**. Click **Stop** to end the current file and skip the rest.
-   Files already written are kept.
+3. Click **Convert**. Click **Stop** to end the current file (and anything the
+   converter started) and skip the rest. Files already written are kept.
 
 The log shows each file as it starts, a progress bar for the current file when
 the converter reports progress, and the files it wrote with their sizes.
 
 Output is written **next to each source ISO**. Server input writes to the
 program's folder.
+
+Before converting, the app checks two things:
+- **Free space:** each output folder must have room for the ISO files going into
+  it, since the output is about the same size. If not, the run does not start.
+- **Existing files:** if a file in the output folder starts with an ISO's name,
+  the app asks before continuing. The converter's exact output names are not
+  known, so this check is conservative.
 
 Settings (options, last folder, server address) are remembered between runs.
 
@@ -63,7 +70,11 @@ Settings (options, last folder, server address) are remembered between runs.
   so. Only files directly in that folder are checked, not subfolders.
 - **Check for Updates** opens the project website. It does not download or
   replace the program.
-- Drag and drop and the file list accept only `.iso` files.
+- Drag and drop and the file list accept only `.iso` files. Drops are ignored
+  while a conversion runs.
+- File names are passed to the converter without conversion, so names with
+  characters outside Unicode are kept intact.
+- The log keeps the newest 5,000 lines.
 
 ## Known gaps
 
@@ -73,6 +84,20 @@ Settings (options, last folder, server address) are remembered between runs.
   the real converter to check.
 - File names with accented letters should work (the original Java program had a
   bug there), but this has not been tested on this machine.
+
+## Development
+
+```
+cd app
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+The tests include an end-to-end run against a fake converter (a shell script).
+That test runs on Linux and macOS only.
+
+CI (`.github/workflows/ci.yml`) runs these checks on Windows and Linux.
 
 ## Folder layout
 
