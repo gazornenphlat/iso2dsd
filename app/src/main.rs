@@ -63,6 +63,9 @@ struct App {
     help: Option<String>,
     notice: Option<(String, String)>,
     converter_found: bool,
+    /// Whether the window was focused on the last frame, so a return to focus
+    /// can re-check for the converter.
+    was_focused: bool,
     frames: u32,
     shot: Option<PathBuf>,
     stop: Stop,
@@ -85,6 +88,7 @@ impl App {
             help: None,
             notice: None,
             converter_found: app_dir().join(program_name()).exists(),
+            was_focused: true,
             frames: 0,
             shot,
             stop: Stop::default(),
@@ -94,6 +98,12 @@ impl App {
 
     fn busy(&self) -> bool {
         self.rx.is_some()
+    }
+
+    /// Re-reads whether the converter is next to the program. The footer
+    /// shows this, and it was only checked at launch before.
+    fn refresh_converter(&mut self) {
+        self.converter_found = app_dir().join(program_name()).exists();
     }
 
     fn add_files(&mut self, paths: Vec<PathBuf>) {
@@ -109,6 +119,7 @@ impl App {
     }
 
     fn start_convert(&mut self) {
+        self.refresh_converter();
         let opts = self.s.options.clone();
         let jobs: Vec<Job> = match self.s.input_mode {
             InputMode::Files => {
@@ -133,6 +144,10 @@ impl App {
                     .collect()
             }
             InputMode::Server => {
+                if let Some(message) = server_address_error(&self.s.octets, &self.s.port) {
+                    self.notice = Some(("Check the server address".into(), message));
+                    return;
+                }
                 let address = self.server_address();
                 vec![Job {
                     work_dir: app_dir(),
@@ -416,7 +431,10 @@ impl App {
             ui.label(":");
             ui.add(egui::TextEdit::singleline(&mut self.s.port).desired_width(56.0));
         });
-        ui.label(RichText::new("Each part is 0 to 255. Port 2002 is the default.").color(MUTED));
+        ui.label(
+            RichText::new("Each part is 0 to 255. Port 2002 is the default; use 1 to 65535.")
+                .color(MUTED),
+        );
     }
 
     fn draw_log(&mut self, ui: &mut egui::Ui) {
@@ -588,6 +606,13 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker();
+        // The converter may have been dropped next to the program while the
+        // window was in the background; re-check when focus comes back.
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        if focused && !self.was_focused {
+            self.refresh_converter();
+        }
+        self.was_focused = focused;
         self.handle_drops(ctx);
         self.draw_header(ctx);
         self.draw_footer(ctx);
@@ -705,6 +730,28 @@ fn server_address(octets: &[String; 4], port: &str) -> String {
     }
 }
 
+/// What's wrong with the server address, if anything. The 0.0.0.0 placeholder
+/// inherited from the original is not a usable server, and the port box allows
+/// five digits (up to 99999) while a port only goes to 65535. An empty port is
+/// allowed: it is left off the address.
+fn server_address_error(octets: &[String; 4], port: &str) -> Option<String> {
+    if octets
+        .iter()
+        .all(|o| o.parse::<u32>().unwrap_or(0) == 0)
+    {
+        return Some(
+            "The server address is still 0.0.0.0. Enter your player's address first.".into(),
+        );
+    }
+    if !port.is_empty() {
+        match port.parse::<u32>() {
+            Ok(p) if (1..=65535).contains(&p) => {}
+            _ => return Some("The port must be between 1 and 65535.".into()),
+        }
+    }
+    None
+}
+
 /// Checks that each output folder has room for the ISO files written into it.
 /// The output is about the same size as the input, so the ISO sizes are the estimate.
 fn space_shortfall(files: &[PathBuf]) -> Option<String> {
@@ -736,8 +783,10 @@ fn gigabytes(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
 }
 
-/// Files already in an output folder whose names start with an ISO's name.
-/// The converter's output names are not known for certain, so this is a conservative check.
+/// Files already in an output folder (or one of its subfolders) whose names
+/// start with an ISO's name. The converter's output names are not known for
+/// certain, so this is a conservative check. Names are paths relative to the
+/// output folder, so a match in a subfolder is told apart from a top-level one.
 fn existing_outputs(files: &[PathBuf]) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     for f in files {
@@ -750,20 +799,35 @@ fn existing_outputs(files: &[PathBuf]) -> Vec<String> {
         } else {
             dir
         };
-        let Ok(entries) = fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !is_iso(&path) && name.starts_with(&stem) && path.is_file() && !found.contains(&name)
-            {
-                found.push(name);
-            }
-        }
+        collect_existing(dir, dir, &stem, &mut found);
     }
     found.sort();
     found
+}
+
+/// Walks `dir` into `found`. Symlinked folders are not followed, so a link
+/// loop cannot recurse forever.
+fn collect_existing(dir: &Path, root: &Path, stem: &str, found: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            collect_existing(&entry.path(), root, stem, found);
+            continue;
+        }
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel = path
+            .strip_prefix(root)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| path.clone())
+            .to_string_lossy()
+            .into_owned();
+        if !is_iso(&path) && name.starts_with(stem) && path.is_file() && !found.contains(&rel) {
+            found.push(rel);
+        }
+    }
 }
 
 fn is_iso(p: &Path) -> bool {
@@ -799,8 +863,40 @@ mod tests {
     }
 
     #[test]
+    fn server_address_error_rejects_placeholder_and_bad_ports() {
+        let zeros: [String; 4] = std::array::from_fn(|_| "0".to_string());
+        assert!(server_address_error(&zeros, "2002").is_some());
+        let addr = ["192".to_string(), "168".into(), "1".into(), "10".into()];
+        assert!(server_address_error(&addr, "2002").is_none());
+        assert!(server_address_error(&addr, "").is_none());
+        assert!(server_address_error(&addr, "65535").is_none());
+        assert!(server_address_error(&addr, "65536").is_some());
+        assert!(server_address_error(&addr, "99999").is_some());
+        assert!(server_address_error(&addr, "0").is_some());
+    }
+
+    #[test]
+    fn existing_outputs_sees_subfolders() {
+        let dir = std::env::temp_dir().join(format!("iso2dsd-test-existing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        let iso = dir.join("disc.iso");
+        fs::write(&iso, []).unwrap();
+        fs::write(dir.join("sub").join("disc-track1.dsf"), []).unwrap();
+        fs::write(dir.join("unrelated.txt"), []).unwrap();
+        let found = existing_outputs(std::slice::from_ref(&iso));
+        let expected = Path::new("sub")
+            .join("disc-track1.dsf")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(found, [expected]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn only_iso_files_are_accepted() {
         assert!(is_iso(Path::new("Disc.ISO")));
         assert!(!is_iso(Path::new("notes.iso.txt")));
     }
 }
+

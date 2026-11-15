@@ -12,7 +12,9 @@ once per file.
 - Rust (stable) with cargo, to build.
 - The converter `sacd_extract.exe` (Windows) or `sacd_extract` (Linux/macOS),
   downloaded separately from the SACD-Ripper releases. Put it in the same folder
-  as the built program. The footer shows "Converter ready" when it is found.
+  as the built program. The footer shows "Converter ready" when it is found;
+  the check runs again when the window regains focus and at the start of a
+  conversion.
 
 ## Build and run
 
@@ -56,9 +58,9 @@ program's folder.
 Before converting, the app checks two things:
 - **Free space:** each output folder must have room for the ISO files going into
   it, since the output is about the same size. If not, the run does not start.
-- **Existing files:** if a file in the output folder starts with an ISO's name,
-  the app asks before continuing. The converter's exact output names are not
-  known, so this check is conservative.
+- **Existing files:** if a file in the output folder (or one of its subfolders)
+  starts with an ISO's name, the app asks before continuing. The converter's
+  exact output names are not known, so this check is conservative.
 
 Settings (options, last folder, server address) are remembered between runs.
 
@@ -67,7 +69,7 @@ Settings (options, last folder, server address) are remembered between runs.
 - Flags are added in this order: `-c`, `-C`, `-P`, channel, format, `--input`.
 - The converter runs once per selected file, one after another.
 - If a run finishes without writing any file in the output folder, the log says
-  so. Only files directly in that folder are checked, not subfolders.
+  so. Files in subfolders are checked too.
 - **Check for Updates** opens the project website. It does not download or
   replace the program.
 - Drag and drop and the file list accept only `.iso` files. Drops are ignored
@@ -105,10 +107,9 @@ CI (`.github/workflows/ci.yml`) runs these checks on Windows and Linux.
 |---|---|
 | `app/` | The Rust application (`src/main.rs` UI, `src/convert.rs` converter runner, `Cargo.toml`). |
 | `app/MECHANICS.md`, `app/mechanics.json` | The original program's values and rules, with where each came from. |
-| `investigation.cany/` | Notes from the investigation of the original jar. Managed by that tool (`project.toml`, evidence IDs); edit with care. |
-| `checks/` | Checks of the converter's documentation and two project web pages. |
-| `capture/` | Capture notes. |
-| `app/target`, `app/target-new` | Old build output. Safe to delete once the program is not running. |
+| `.github/` | CI workflow (format check, Clippy, tests on Windows and Linux). |
+| `readme.md` | This file. |
+| `.gitignore` | Build output and screenshot folders kept out of the repo. |
 
 ## Licensing
 
