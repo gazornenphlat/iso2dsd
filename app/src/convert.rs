@@ -360,25 +360,42 @@ fn wait_for(stop: &Stop) -> io::Result<Option<ExitStatus>> {
 
 type Snapshot = Vec<(OsString, (SystemTime, u64))>;
 
-/// Files directly in `dir`, with their modified time and size, sorted by name.
+/// Files under `dir`, including subfolders, keyed by their path relative to
+/// `dir`, with their modified time and size, sorted by path.
 fn snapshot(dir: &Path) -> Snapshot {
     let mut files = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                if meta.is_file() {
-                    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                    files.push((entry.file_name(), (mtime, meta.len())));
-                }
-            }
-        }
-    }
+    collect_files(dir, dir, &mut files);
     files.sort_by(|a, b| a.0.cmp(&b.0));
     files
 }
 
-/// Lists files that were added or changed in `dir` while the job ran.
-/// Only files directly in that folder are checked; files in subfolders are not listed.
+/// Walks `dir` into `files`. Symlinked folders are not followed, so a link
+/// loop cannot recurse forever.
+fn collect_files(dir: &Path, root: &Path, files: &mut Snapshot) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            collect_files(&entry.path(), root, files);
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if meta.is_file() {
+                let rel = entry
+                    .path()
+                    .strip_prefix(root)
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|_| entry.path());
+                let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                files.push((rel.into_os_string(), (mtime, meta.len())));
+            }
+        }
+    }
+}
+
+/// Lists files that were added or changed in `dir` while the job ran,
+/// including files in subfolders.
 fn report_new_files(dir: &Path, before: &Snapshot, tx: &Sender<Msg>) {
     let after = snapshot(dir);
     let written: Vec<(String, u64)> = after
@@ -517,6 +534,26 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_lists_files_in_subfolders() {
+        let dir = std::env::temp_dir().join(format!("iso2dsd-test-snapshot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("top.dsf"), b"ab").unwrap();
+        fs::write(dir.join("sub").join("nested.dsf"), b"abc").unwrap();
+        let snap = snapshot(&dir);
+        let names: Vec<String> = snap
+            .iter()
+            .map(|(n, _)| n.to_string_lossy().into_owned())
+            .collect();
+        let nested = Path::new("sub")
+            .join("nested.dsf")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(names, [nested, "top.dsf".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn log_keeps_only_the_newest_lines() {
         let mut log = Log::default();
         for i in 0..(MAX_LOG_LINES + 10) {
@@ -625,3 +662,4 @@ mod fake_converter {
         assert!(lines.iter().any(|l| l.starts_with("Stopped.")), "{lines:?}");
     }
 }
+
